@@ -2452,3 +2452,64 @@ body.civitai-neo-card-theme .card:hover .civitai-neo-bottom-actions {
 body.civ-dl-origin-local #DownloadProgress {
     display: none !important;
 }
+
+/* Download progress bar drawn by the status poller (_renderCivDlBar in
+   civitai-html.js) in #browser_download_progress and #local_download_progress.
+   Theme variables keep it readable in both light and dark themes. */
+.civ-dl-bar {
+    margin: 6px 0;
+}
+
+.civ-dl-bar-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 4px;
+    font-size: var(--text-sm);
+}
+
+.civ-dl-bar-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--body-text-color-subdued);
+}
+
+.civ-dl-bar-pct {
+    flex-shrink: 0;
+    color: var(--body-text-color);
+    font-variant-numeric: tabular-nums;
+}
+
+.civ-dl-bar-track {
+    height: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border-color-primary);
+    border-radius: var(--radius-lg);
+    background: var(--background-fill-secondary);
+}
+
+.civ-dl-bar-fill {
+    height: 100%;
+    width: 0;
+    background: var(--color-accent);
+    transition: width .3s ease;
+}
+
+.civ-dl-bar[data-state="done"] .civ-dl-bar-fill {
+    background: var(--color-green-500, #22c55e);
+}
+
+.civ-dl-bar[data-state="failed"] .civ-dl-bar-fill {
+    background: var(--color-red-500, #ef4444);
+}
+
+.civ-dl-bar[data-state="failed"] .civ-dl-bar-label {
+    color: var(--error-text-color, var(--color-red-500, #ef4444));
+}
+
+.civ-dl-bar[data-state="failed"] .civ-dl-bar-pct {
+    display: none;
+}

@@ -1377,208 +1377,254 @@ function _currentDlOrigin() {
     return (item && item.getAttribute('dl_origin')) || 'browser';
 }
 
-// Mirror the live #DownloadProgress bar into the Local Models tab, so updates started
-// from there (Update to latest / Update selected) show progress without switching tabs.
-function setLocalDownloadProgressBar(attempt) {
-    attempt = attempt || 0;
-    const target = document.querySelector('#local_download_progress');
-    if (!target) return;
+// === Download progress (polled from the server) ===
+// Progress used to be read from Gradio's own #DownloadProgress bar. That bar lives on
+// the SSE connection of the event running the download: when the connection drops
+// (screen lock, sleeping tab) the bar freezes, and the outputs that start the next
+// queue item never arrive. The server keeps a status snapshot instead
+// (civitai_download.get_download_status); this poller draws the bars from it and
+// replays the queue/finish triggers this page missed.
+const CIV_DL_STATUS_PATH = 'civitai-neo/download-status';
+const CIV_DL_POLL_MS = 1000;
+// The server must have been idle this long before a missed trigger is replayed, so a
+// trigger that is merely in flight is never fired twice.
+const CIV_DL_REPLAY_AFTER_S = 5;
 
-    // Wait until the native progress bar exists (download starts async), then mirror it.
-    // Give up after ~10s so an update that queues nothing (already on latest) doesn't
-    // leave a retry loop running forever.
-    const container0 = document.querySelector('#DownloadProgress');
-    const bar0 = container0 && container0.querySelector('.progress-bar');
-    if (!bar0 || !bar0.style.width) {
-        if (attempt < 20) {
-            setTimeout(() => setLocalDownloadProgressBar(attempt + 1), 500);
-        }
-        return;
-    }
+let _civDlPoller = null;
+let _civDlFetching = false;
+let _civDlStatusUrl = null;
+let _civDlShown = { id: null, state: null };
+// When this page first saw the server idle with work left (null while it is busy).
+let _civDlStalledSince = null;
+// dl_ids this page has shown as pending: replays only act on this page's own downloads.
+const _civDlSeenIds = new Set();
 
-    // Only mirror downloads whose queue item originated in the Local tab. Checked after
-    // the bar exists so the item's dl_origin attribute is already in the DOM.
-    if (_currentDlOrigin() !== 'local') {
-        target.innerHTML = '<div style="min-height:0px;"></div>';
-        return;
-    }
+function _civDlStatusUrls() {
+    const urls = [];
+    const root = window.gradio_config && window.gradio_config.root;
+    if (root) urls.push(root.replace(/\/+$/, '') + '/' + CIV_DL_STATUS_PATH);
+    urls.push('/' + CIV_DL_STATUS_PATH);
+    return urls;
+}
 
-    const render = (pct, label, state) => {
-        const colour = state === 'failed' ? '#b54a4a' : (state === 'done' ? '#3a8f4f' : '#3b6fb5');
-        target.innerHTML =
-            '<div style="margin:6px 0;">' +
-              '<div style="font-size:12px;opacity:.8;margin-bottom:3px;">' + (label || '') + '</div>' +
-              '<div style="background:#2a2a2a;border-radius:6px;overflow:hidden;height:20px;">' +
-                '<div style="height:100%;width:' + pct + '%;background:' + colour + ';' +
-                'transition:width .2s;text-align:center;color:#fff;font-size:12px;line-height:20px;">' +
-                  pct.toFixed(1) + '%' +
-                '</div>' +
-              '</div>' +
-            '</div>';
-    };
-
-    const clearSoon = () => setTimeout(() => {
-        const t = document.querySelector('#local_download_progress');
-        if (t) t.innerHTML = '<div style="min-height:0px;"></div>';
-    }, 3000);
-
-    let sawProgress = false;
-    const worker = _createWorkerInterval(() => {
-        const container = document.querySelector('#DownloadProgress');
-        const bar = container && container.querySelector('.progress-bar');
-        const innerEl = container && container.querySelector('.progress-level-inner');
-        if (!bar || !bar.style.width) {
-            // Native bar gone/reset. If we'd already shown progress, the download finished
-            // (Gradio clears #DownloadProgress on completion) — finalize so the bar doesn't
-            // stay stuck at the last percentage.
-            if (sawProgress) {
-                render(100, 'Completed', 'done');
-                worker.stop();
-                clearSoon();
+async function _fetchCivDlStatus() {
+    const urls = _civDlStatusUrl ? [_civDlStatusUrl] : _civDlStatusUrls();
+    for (const url of urls) {
+        try {
+            const response = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+            if (response.ok) {
+                _civDlStatusUrl = url;
+                return await response.json();
             }
-            return;
+        } catch (e) {
+            // Server restarting or unreachable: try again on the next tick.
         }
-        const pct = parseFloat(bar.style.width) || 0;
-        const label = innerEl ? innerEl.innerText : '';
-        sawProgress = true;
+    }
+    return null;
+}
 
-        if (/Encountered an error during download of|not found on CivitAI servers|requires a personal CivitAI API/.test(label)) {
-            render(0, 'Download failed', 'failed');
-            worker.stop();
-            clearSoon();
-            return;
+function _civDlTextarea(id) {
+    return gradioApp().querySelector('#' + id + ' textarea');
+}
+
+function _civDlSetInput(id, value) {
+    const el = _civDlTextarea(id);
+    if (!el || value === null || value === undefined || el.value === value) return false;
+    el.value = value;
+    updateInput(el);
+    return true;
+}
+
+function _syncCivDlQueueHtml() {
+    const gradio_html = _civDlTextarea('queue_html_input');
+    if (!gradio_html) return;
+    gradio_html.value = ((document.querySelector('#civitai_dl_list.prose') || document.querySelector('#civitai_dl_list') || {}).innerHTML || '');
+    updateInput(gradio_html);
+}
+
+// Colours come from the Gradio theme (see .civ-dl-bar in style.css). The bar is
+// updated in place so its width animates between polls instead of being rebuilt.
+function _renderCivDlBar(target, pct, label, state) {
+    if (!target) return;
+    let bar = target.querySelector('.civ-dl-bar');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.className = 'civ-dl-bar';
+        bar.innerHTML =
+            '<div class="civ-dl-bar-head">' +
+              '<span class="civ-dl-bar-label"></span>' +
+              '<span class="civ-dl-bar-pct"></span>' +
+            '</div>' +
+            '<div class="civ-dl-bar-track"><div class="civ-dl-bar-fill"></div></div>';
+        target.replaceChildren(bar);
+    }
+    bar.dataset.state = state;
+    const labelEl = bar.querySelector('.civ-dl-bar-label');
+    labelEl.textContent = label || '';
+    labelEl.title = label || '';
+    bar.querySelector('.civ-dl-bar-pct').textContent = pct.toFixed(1) + '%';
+    bar.querySelector('.civ-dl-bar-fill').style.width = pct + '%';
+}
+
+function _clearCivDlBar(target) {
+    if (target) target.innerHTML = '<div style="min-height:0px;"></div>';
+}
+
+// The bar for the tab the download came from; the other tab's bar is cleared.
+function _civDlTabTargets(origin) {
+    const browser = document.querySelector('#browser_download_progress');
+    const local = document.querySelector('#local_download_progress');
+    return origin === 'local' ? [local, browser] : [browser, local];
+}
+
+function _finalizeCivDlItem(item, dlId, result, nonQueue) {
+    const btn = item.querySelector('.dl_action_btn > span');
+    if (btn) {
+        btn.innerText = 'Remove';
+        btn.setAttribute('onclick', 'removeDlItem(' + parseInt(dlId) + ', this)');
+    }
+    if (nonQueue && item.parentNode !== nonQueue) nonQueue.appendChild(item);
+    const bar = item.querySelector('.dl_progress_bar');
+    if (result === 'completed') {
+        item.className = 'civitai_dl_item_completed';
+        if (bar) { bar.textContent = 'Completed'; bar.style.width = '100%'; }
+    } else {
+        item.className = 'civitai_dl_item_failed';
+        if (bar) { bar.textContent = result === 'cancelled' ? 'Cancelled' : 'Failed'; bar.style.width = '0%'; }
+    }
+}
+
+function _applyCivDlStatus(s, list) {
+    const nonQueue = list.querySelector('.civitai_nonqueue_list');
+    const results = s.results || {};
+    const queueIds = s.queue_ids || [];
+    let changed = false;
+
+    list.querySelectorAll('.civitai_dl_item').forEach((item) => {
+        const id = item.getAttribute('dl_id');
+        _civDlSeenIds.add(id);
+        const result = results[id];
+        if (result) {
+            _finalizeCivDlItem(item, id, result, nonQueue);
+            changed = true;
         }
-        if (pct >= 100) {
-            render(100, 'Completed', 'done');
-            worker.stop();
-            clearSoon();
-            return;
+    });
+
+    const pct = Math.max(0, Math.min(100, (Number(s.progress) || 0) * 100));
+    const [target, other] = _civDlTabTargets(s.origin);
+    const finalState = s.dl_id ? results[s.dl_id] : null;
+
+    if (s.running && s.dl_id && s.state === 'downloading' && _civDlSeenIds.has(s.dl_id)) {
+        const item = list.querySelector('.civitai_dl_item[dl_id="' + parseInt(s.dl_id) + '"]');
+        if (item) {
+            if (nonQueue && item.parentNode !== nonQueue) {
+                nonQueue.appendChild(item);
+                const btn = item.querySelector('.dl_action_btn > span');
+                if (btn) {
+                    btn.innerText = 'Cancel';
+                    btn.setAttribute('onclick', 'cancelQueueDl()');
+                }
+                changed = true;
+            }
+            const bar = item.querySelector('.dl_progress_bar');
+            if (bar) {
+                bar.textContent = pct.toFixed(1) + '%';
+                bar.style.width = pct + '%';
+                bar.title = s.desc || '';
+            }
         }
-        render(pct, label, 'active');
-    }, 300);
+        setCivDownloadOrigin(s.origin || 'browser');
+        _renderCivDlBar(target, pct, s.desc, 'active');
+        _clearCivDlBar(other);
+        _civDlShown = { id: s.dl_id, state: 'active' };
+    } else if (finalState && _civDlShown.id === s.dl_id && _civDlShown.state === 'active') {
+        if (finalState === 'completed') {
+            _renderCivDlBar(target, 100, 'Completed', 'done');
+        } else {
+            // Full-width red bar (its % is hidden by CSS) so the failure reads at a glance.
+            _renderCivDlBar(target, 100, finalState === 'cancelled' ? 'Download cancelled' : (s.desc || 'Download failed'), 'failed');
+        }
+        _civDlShown = { id: s.dl_id, state: finalState };
+        setTimeout(() => {
+            if (_civDlShown.id === s.dl_id && _civDlShown.state === finalState) _clearCivDlBar(target);
+        }, 3000);
+    }
+
+    if (changed) _syncCivDlQueueHtml();
+    _replayCivDlTriggers(s, queueIds);
+}
+
+// Replays the outputs of a run whose connection dropped: the queue trigger starts the
+// next item, the finish trigger refreshes buttons and cards once the queue is empty.
+// A page that did receive them already holds the same values, so nothing fires twice.
+function _replayCivDlTriggers(s, queueIds) {
+    if (s.running || s.awaiting_choice) {
+        _civDlStalledSince = null;
+        return;
+    }
+    // Both clocks must agree the server has been idle: the server's covers a run that
+    // just ended, this page's covers a queue that was just filled and is starting.
+    const now = Date.now();
+    if (_civDlStalledSince === null) _civDlStalledSince = now;
+    if (s.idle_age < CIV_DL_REPLAY_AFTER_S || now - _civDlStalledSince < CIV_DL_REPLAY_AFTER_S * 1000) return;
+    if (queueIds.length) {
+        if (_civDlSeenIds.has(queueIds[0])) _civDlSetInput('civitai_queue_trigger', s.queue_trigger);
+    } else if (s.dl_id && _civDlSeenIds.has(s.dl_id)) {
+        _civDlSetInput('civitai_current_model', s.current_model);
+        _civDlSetInput('civitai_download_finish', s.download_finish);
+    }
+}
+
+// True while this page still has work to watch: pending items, or a finish trigger
+// it has not received yet.
+function _civDlNeedsPolling(s, list) {
+    if (list.querySelector('.civitai_dl_item')) return true;
+    if (!s || s.running) return true;
+    if (!s.dl_id || !_civDlSeenIds.has(s.dl_id) || !s.download_finish) return false;
+    const finish = _civDlTextarea('civitai_download_finish');
+    return !!finish && finish.value !== s.download_finish;
+}
+
+async function _civDlTick() {
+    if (_civDlFetching) return;
+    const list = document.getElementById('civitai_dl_list');
+    if (!list) return;
+    _civDlFetching = true;
+    let status = null;
+    try {
+        status = await _fetchCivDlStatus();
+        if (status) _applyCivDlStatus(status, list);
+    } finally {
+        _civDlFetching = false;
+    }
+    if (status && !_civDlNeedsPolling(status, list)) _stopCivDlPoller();
+}
+
+function _startCivDlPoller() {
+    if (_civDlPoller) return;
+    _civDlStalledSince = null;
+    _civDlPoller = _createWorkerInterval(_civDlTick, CIV_DL_POLL_MS);
+    _civDlTick();
+}
+
+function _stopCivDlPoller() {
+    if (!_civDlPoller) return;
+    _civDlPoller.stop();
+    _civDlPoller = null;
+}
+
+// Kept as entry points: both run when a download starts or the queue advances.
+function setLocalDownloadProgressBar() {
+    _startCivDlPoller();
 }
 
 function setDownloadProgressBar() {
-    const gradio_html = gradioApp().querySelector('#queue_html_input textarea');
-
-    // Sync the per-tab origin from the active queue item UP FRONT — before waiting for the
-    // native bar to render. A previous Local download leaves body.civ-dl-origin-local set,
-    // and the CSS hides #DownloadProgress while that class is present. If we waited for the
-    // (hidden) bar first, we'd deadlock: the bar stays hidden because the origin is still
-    // 'local', and the origin never flips to 'browser' because we never get past the wait.
-    // Flipping it here re-shows the Browser bar the moment a Browser download starts.
+    // Sync the per-tab origin from the active queue item up front, so the CSS that
+    // hides #DownloadProgress for Local downloads flips back for a Browser download.
     if (document.querySelector('#civitai_dl_list .civitai_dl_item')) {
         setCivDownloadOrigin(_currentDlOrigin());
     }
-
-    let browserContainer = document.querySelector('#DownloadProgress');
-    let browserProgress = browserContainer.querySelector('.progress-bar');
-    if (!browserProgress || !browserProgress.style.width) {
-        setTimeout(setDownloadProgressBar, 500);
-        return;
-    }
-
-    let dlList = document.getElementById('civitai_dl_list');
-    let nonQueue = dlList.querySelector('.civitai_nonqueue_list');
-    let dlItem = dlList.querySelector('.civitai_dl_item');
-    let dlBtn = dlItem.querySelector('.dl_action_btn > span');
-    dlBtn.innerText = 'Cancel';
-    dlBtn.setAttribute('onclick', 'cancelQueueDl()');
-    let dlId = dlItem.getAttribute('dl_id');
-    // The starting item's origin decides which tab shows progress (CSS body class).
-    setCivDownloadOrigin(dlItem.getAttribute('dl_origin') || 'browser');
-    let selector = '.civitai_dl_item[dl_id="' + parseInt(dlId) + '"]';
-
-    let dlProgressBar = null;
-    let percentage = null;
-    let dlText = null;
-
-    nonQueue.appendChild(dlItem);
-
-    const worker = _createWorkerInterval(() => {
-        browserContainer = document.querySelector('#DownloadProgress');
-        if (!browserContainer) {
-            return; // User switched tab, container not in DOM
-        }
-        browserProgress = browserContainer.querySelector('.progress-bar');
-        dlText = browserContainer.querySelector('.progress-level-inner');
-        if (!dlText || !browserProgress) {
-            return;
-        }
-        dlText = dlText.innerText;
-        percentage = parseFloat(browserProgress.style.width);
-
-        dlItem = dlList.querySelector(selector);
-        if (!dlItem) {
-            return;
-        }
-        dlProgressBar = dlItem.querySelector('.dl_progress_bar');
-        if (!dlProgressBar) {
-            return;
-        }
-
-        dlProgressBar.textContent = percentage.toFixed(1) + '%';
-        dlProgressBar.style.width = percentage + '%';
-
-        if (percentage >= 100) {
-            worker.stop();
-            dlBtn = dlItem.querySelector('.dl_action_btn > span');
-            dlBtn.innerText = 'Remove';
-            dlBtn.setAttribute('onclick', 'removeDlItem(' + parseInt(dlId) + ', this)');
-            dlItem.className = 'civitai_dl_item_completed';
-            dlProgressBar.textContent = 'Completed';
-            dlProgressBar.style.width = '100%';
-            const gradio_input = ((document.querySelector('#civitai_dl_list.prose') || document.querySelector('#civitai_dl_list') || {}).innerHTML || '');
-            gradio_html.value = gradio_input;
-            updateInput(gradio_html);
-            return;
-        }
-
-        if (currentDlCancelled) {
-            worker.stop();
-            dlBtn = dlItem.querySelector('.dl_action_btn > span');
-            dlBtn.innerText = 'Remove';
-            dlBtn.setAttribute('onclick', 'removeDlItem(' + parseInt(dlId) + ', this)');
-            currentDlCancelled = false;
-            dlItem.className = 'civitai_dl_item_failed';
-            dlProgressBar.textContent = 'Cancelled';
-            dlProgressBar.style.width = '0%';
-            const gradio_input = ((document.querySelector('#civitai_dl_list.prose') || document.querySelector('#civitai_dl_list') || {}).innerHTML || '');
-            gradio_html.value = gradio_input;
-            updateInput(gradio_html);
-            return;
-        } else if (allDlCancelled) {
-            worker.stop();
-            allDlCancelled = false;
-            let dlItems = dlList.querySelectorAll('.civitai_dl_item');
-            dlItems.forEach(function (item) {
-                dlBtn = dlItem.querySelector('.dl_action_btn > span');
-                dlBtn.innerText = 'Remove';
-                dlBtn.setAttribute('onclick', 'removeDlItem(' + parseInt(dlId) + ', this)');
-                dlProgressBar = item.querySelector('.dl_progress_bar');
-                dlProgressBar.textContent = 'Cancelled';
-                dlProgressBar.style.width = '0%';
-                nonQueue.appendChild(item);
-                item.className = 'civitai_dl_item_failed';
-            });
-            const gradio_input = ((document.querySelector('#civitai_dl_list.prose') || document.querySelector('#civitai_dl_list') || {}).innerHTML || '');
-            gradio_html.value = gradio_input;
-            updateInput(gradio_html);
-            return;
-        } else if (dlText.includes('Encountered an error during download of') || dlText.includes('not found on CivitAI servers') || dlText.includes('requires a personal CivitAI API to be downloaded')) {
-            worker.stop();
-            dlBtn = dlItem.querySelector('.dl_action_btn > span');
-            dlBtn.innerText = 'Remove';
-            dlBtn.setAttribute('onclick', 'removeDlItem(' + parseInt(dlId) + ', this)');
-            dlItem.className = 'civitai_dl_item_failed';
-            dlProgressBar.textContent = 'Failed';
-            dlProgressBar.style.width = '0%';
-            const gradio_input = ((document.querySelector('#civitai_dl_list.prose') || document.querySelector('#civitai_dl_list') || {}).innerHTML || '');
-            gradio_html.value = gradio_input;
-            updateInput(gradio_html);
-            return;
-        }
-    });
+    _startCivDlPoller();
 }
 
 // === Queue Restore Banner ===

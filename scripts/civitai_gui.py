@@ -407,6 +407,10 @@ def on_ui_tabs():
                 list_html = gr.HTML(value='<div style="font-size: 24px; text-align: center; margin: 50px;">Click the search icon to load models.<br>Use the filter icon to filter results.</div>')
             with gr.Row():
                 download_progress = gr.HTML(value='<div style="min-height: 0px;"></div>', elem_id='DownloadProgress')
+            # Live download progress drawn by JS from the download-status endpoint, so it
+            # keeps updating after the Gradio connection drops. Pure JS target.
+            with gr.Row():
+                gr.HTML(value='<div style="min-height: 0px;"></div>', elem_id='browser_download_progress')
             with gr.Row():
                 list_models = gr.Dropdown(label='Model:', choices=[], interactive=False, elem_id='quicksettings1', value=None)
                 list_versions = gr.Dropdown(label='Version:', choices=[], interactive=False, elem_id='quicksettings0', value=None)
@@ -744,7 +748,7 @@ def on_ui_tabs():
 
         gr.Textbox(elem_id='custom_subfolders_list', visible=False, value=format_custom_subfolders())
         model_id = gr.Textbox(visible=False)
-        queue_trigger = gr.Textbox(visible=False)
+        queue_trigger = gr.Textbox(elem_id='civitai_queue_trigger', visible=False)
         dl_url = gr.Textbox(visible=False)
         civitai_text2img_output = gr.Textbox(visible=False)
         civitai_text2img_input = gr.Textbox(elem_id='civitai_text2img_input', visible=False)
@@ -767,7 +771,7 @@ def on_ui_tabs():
         click_first_item = gr.Textbox(visible=False)
         empty = gr.Textbox(value='', visible=False)
         download_start = gr.Textbox(visible=False)
-        download_finish = gr.Textbox(visible=False)
+        download_finish = gr.Textbox(elem_id='civitai_download_finish', visible=False)
         tag_start = gr.Textbox(visible=False)
         tag_finish = gr.Textbox(visible=False)
         preview_start = gr.Textbox(visible=False)
@@ -781,7 +785,7 @@ def on_ui_tabs():
         delete_finish = gr.Textbox(elem_id='delete_finish', visible=False)
         export_csv_output  = gr.Textbox(elem_id='export_csv_output',  visible=False)
         export_json_output = gr.Textbox(elem_id='export_json_output', visible=False)
-        current_model = gr.Textbox(visible=False)
+        current_model = gr.Textbox(elem_id='civitai_current_model', visible=False)
         current_sha256 = gr.Textbox(visible=False)
         # Ambiguity chooser: receives HTML for choices and a hidden textarea to send selected index
         ambiguity_html = gr.HTML(value='', visible=False, elem_id='ambiguity_html')
@@ -1661,6 +1665,8 @@ def on_ui_tabs():
         for component in [download_start, queue_trigger]:
             component.change(fn=None, _js='() => setDownloadProgressBar()')
             component.change(fn=None, _js='() => setLocalDownloadProgressBar()')
+            # Progress is drawn by JS from the download-status endpoint (it survives a
+            # dropped connection); Gradio's own bar would freeze, so keep it hidden.
             component.change(
                 fn=_download.download_create_thread,
                 inputs=[download_finish, queue_trigger],
@@ -1669,7 +1675,8 @@ def on_ui_tabs():
                     current_model,
                     download_finish,
                     queue_trigger
-                ]
+                ],
+                show_progress='hidden'
             )
 
         _download_finish_event = download_finish.change(
@@ -2919,5 +2926,11 @@ def on_ui_settings():
         ).info('Advanced: Customize folder names and detection patterns. Leave empty for defaults (SD, SDXL, Pony, Illustrious, NoobAI, Flux.1, Flux.2, Flux.3, Krea, Wan, LTX, LTX 2, Qwen, Qwen 2.1, MiniMax H3, MOSS Image, Iris 3B, Z-Image, Ernie, Lumina, Anima, Chroma)')
     )
 
+def on_app_started(_demo, app):
+    # Polled by the page's download progress bar (see setDownloadProgressBar in JS).
+    app.add_api_route(_download.DOWNLOAD_STATUS_ROUTE, _download.get_download_status, methods=['GET'])
+
+
 script_callbacks.on_ui_tabs(on_ui_tabs)
 script_callbacks.on_ui_settings(on_ui_settings)
+script_callbacks.on_app_started(on_app_started)

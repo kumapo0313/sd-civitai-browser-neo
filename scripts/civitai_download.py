@@ -58,6 +58,77 @@ dl_manager_count = 0
 _not_downloading = threading.Event()
 _not_downloading.set()
 
+# ─── Download status snapshot (served at DOWNLOAD_STATUS_ROUTE) ──────────────
+# The Gradio event that runs download_create_thread() is the only channel that
+# carries progress and the "start the next item" trigger to the browser. When the
+# browser's SSE connection drops (screen lock, sleeping tab), Gradio marks that job
+# dead: the progress bar freezes and the queue never advances. The browser polls
+# this snapshot instead, so the bar keeps moving and the page can restart the queue
+# when the trigger it should have received never arrived.
+DOWNLOAD_STATUS_ROUTE = '/civitai-neo/download-status'
+_RESULT_HISTORY = 100
+
+# Held while download_create_thread() works on an item, so a duplicate trigger
+# (a page resuming the queue while the original chain is still alive) is a no-op.
+_create_thread_lock = threading.Lock()
+# Set when a trigger was turned away by the lock, so the running call keeps the chain going.
+_missed_trigger = threading.Event()
+_dl_status_lock = threading.Lock()
+_dl_status = {
+    'dl_id': None,
+    'origin': None,
+    'state': 'idle',          # idle | downloading | <final state of the last item>
+    'progress': 0.0,
+    'desc': '',
+    'results': {},            # dl_id -> 'completed' | 'failed' | 'cancelled'
+    'queue_trigger': None,    # trigger value the last run handed to the page
+    'download_finish': None,  # finish value the last run handed to the page
+    'current_model': None,
+    'idle_since': time.time(),
+}
+
+
+def _set_dl_status(**fields):
+    with _dl_status_lock:
+        _dl_status.update(fields)
+
+
+def _record_dl_result(dl_id, state):
+    if dl_id is None:
+        return
+    with _dl_status_lock:
+        results = _dl_status['results']
+        results[str(dl_id)] = state
+        while len(results) > _RESULT_HISTORY:
+            results.pop(next(iter(results)))
+
+
+def get_download_status():
+    """JSON-safe snapshot of the download queue for the browser's progress poller."""
+    with _dl_status_lock:
+        snap = dict(_dl_status)
+        snap['results'] = dict(_dl_status['results'])
+    queue_items = list(gl.download_queue)
+    snap['running'] = _create_thread_lock.locked()
+    snap['queue_ids'] = [str(i.get('dl_id')) for i in queue_items]
+    snap['awaiting_choice'] = bool(queue_items and queue_items[0].get('_awaiting_choice'))
+    snap['idle_age'] = 0.0 if snap['running'] else max(0.0, time.time() - snap['idle_since'])
+    if snap['dl_id'] is not None:
+        snap['dl_id'] = str(snap['dl_id'])
+    snap.pop('idle_since', None)
+    return snap
+
+
+def _tracking_progress(progress, dl_id):
+    """Wrap the Gradio progress callable so every update also lands in the status snapshot."""
+    def _progress(p, desc=None):
+        _set_dl_status(dl_id=dl_id, progress=float(p or 0), desc=desc or '')
+        if progress is not None:
+            progress(p, desc=desc)
+    if progress is not None and hasattr(progress, 'join'):
+        _progress.join = progress.join  # type: ignore[attr-defined]
+    return _progress
+
 def random_number(prev=None):
     number = str(random.randint(10000, 99999))
     while number == prev:
@@ -100,6 +171,7 @@ def resolve_ambiguity(choice_index):
                 item['model_filename'] = _api.cleaned_name(cand_fname)
                 debug_print(f"[Ambiguity] Updated filename for '{item.get('model_name')}': {item['model_filename']}")
             item['ambiguous_selected'] = True
+            item.pop('_awaiting_choice', None)
 
             # Clear ambiguity HTML and resume download by nudging download_finish
             return gr.update(value=''), gr.update(value=item.get('model_name')), gr.update(value=random_number()), gr.update(value=None)
@@ -1063,6 +1135,8 @@ def download_cancel_all():
         model_string = f"{item['model_name']} ({item['model_id']})"
         _file.delete_model(0, item['model_filename'], model_string, item['version_name'], False, model_ver=item['model_versions'], model_json=item['model_json'])
     _dl_log.log_all_cancelled()
+    for queued in gl.download_queue:
+        _record_dl_result(queued.get('dl_id'), 'cancelled')
     gl.download_queue = []
     return
 
@@ -1564,6 +1638,41 @@ def download_file_old(url, file_path, model_id, progress=gr.Progress() if queue 
         time.sleep(5)
 
 def download_create_thread(download_finish, queue_trigger, progress=gr_progress_threadable() if queue else None):
+    # A page that lost its connection restarts the queue by changing queue_trigger
+    # (see DOWNLOAD_STATUS_ROUTE). Ignore the trigger while another run is working.
+    if not _create_thread_lock.acquire(blocking=False):
+        debug_print('[Download] Queue already running, ignoring duplicate trigger')
+        _missed_trigger.set()
+        return (gr.update(), gr.update(), gr.update(), gr.update())
+    try:
+        _missed_trigger.clear()
+        outputs = _download_create_thread(download_finish, queue_trigger, progress)
+        if (_missed_trigger.is_set() and gl.download_queue
+                and not gl.download_queue[0].get('_awaiting_choice')
+                and _update_value(outputs[3]) in (None, str(queue_trigger))):
+            # A trigger was dropped while this run held the lock (e.g. a download
+            # queued just as the previous one was finishing): keep the queue moving
+            # instead of ending the chain with items left in it.
+            outputs = (outputs[0], outputs[1], gr.update(value=download_finish), gr.update(value=random_number(queue_trigger)))
+        # Remember what this run handed to the page: if the connection dropped, the
+        # page never got these values and the poller replays them.
+        _set_dl_status(
+            queue_trigger=_update_value(outputs[3]),
+            download_finish=_update_value(outputs[2]),
+            current_model=_update_value(outputs[1]),
+        )
+        return outputs
+    finally:
+        _set_dl_status(idle_since=time.time())
+        _create_thread_lock.release()
+
+
+def _update_value(update):
+    value = update.get('value') if isinstance(update, dict) else None
+    return None if value is None else str(value)
+
+
+def _download_create_thread(download_finish, queue_trigger, progress):
     global current_count
     current_count += 1
 
@@ -1696,6 +1805,9 @@ def download_create_thread(download_finish, queue_trigger, progress=gr_progress_
                     html += '<div style="margin-top:10px"><button onclick="(function(){let v=document.querySelector(\'input[name=\\\'ambig_choice\\\']:checked\'); if(v){let ta=document.getElementById(\'ambiguity_choice\'); if(ta){ta.value=v.value; ta.dispatchEvent(new Event(\'input\'));} let btn=document.getElementById(\'ambiguity_confirm\'); if(btn){btn.click();}} else {alert(\'Please select an option to continue\');}})()">Confirm selection</button></div>'
                     html += '</div>'
 
+                    # Tells the status poller the queue is paused on purpose, so it
+                    # does not restart it while the user is choosing.
+                    item['_awaiting_choice'] = True
                     return (
                         gr.update(value=html),  # Download Progress HTML -> shows chooser
                         gr.update(value=item.get('model_name')),  # Current Model
@@ -1708,6 +1820,10 @@ def download_create_thread(download_finish, queue_trigger, progress=gr_progress_
     # Fix #3: do not mutate item dict — use a local effective path
     # Fallback to install_path if existing_path is None (e.g. lazy fetch returned value=None)
     effective_install_path = (item['existing_path'] or item['install_path']) if item['from_batch'] else item['install_path']
+
+    progress = _tracking_progress(progress, item['dl_id'])
+    _set_dl_status(dl_id=item['dl_id'], origin=item.get('origin') or 'browser',
+                   state='downloading', progress=0.0, desc=f"Starting: {item['model_filename']}")
 
     gl.isDownloading = True
     _not_downloading.clear()  # signal: download in progress
@@ -1872,10 +1988,15 @@ def download_create_thread(download_finish, queue_trigger, progress=gr_progress_
     # Log final download status before removing from queue
     if gl.cancel_status:
         _dl_log.log_cancelled(item['dl_id'])
+        final_state = 'cancelled'
     elif gl.download_fail:
         _dl_log.log_failed(item['dl_id'])
+        final_state = 'failed'
     else:
         _dl_log.log_completed(item['dl_id'])
+        final_state = 'completed'
+    _record_dl_result(item['dl_id'], final_state)
+    _set_dl_status(state=final_state, progress=1.0 if final_state == 'completed' else 0.0)
 
     if len(gl.download_queue) != 0:
         gl.download_queue.pop(0)
